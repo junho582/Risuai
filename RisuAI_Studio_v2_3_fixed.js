@@ -214,187 +214,6 @@ async function getCachedDB(force = false) {
     }
 }
 
-// ══════════════════════════════════════════
-//  COPILOT PROXY FETCH
-// ══════════════════════════════════════════
-function getProxyFn() {
-    if (typeof globalThis !== 'undefined' && globalThis.__pluginApis__?.risuFetch) {
-        return (url, opts={}) => globalThis.__pluginApis__.risuFetch(url, { ...opts, rawResponse: false, nativeResponse: false });
-    }
-    if (typeof risuai?.nativeFetch === 'function') return risuai.nativeFetch.bind(risuai);
-    return null;
-}
-
-async function copilotFetch(url, opts = {}) {
-    const fn = getProxyFn();
-    if (!fn) throw new Error('프록시 fetch를 사용할 수 없습니다.');
-    const body = opts.body && typeof opts.body === 'object' ? JSON.stringify(opts.body) : opts.body;
-    const res = await fn(url, { ...opts, body });
-    const data = typeof res?.json === 'function' ? await res.json() : (res?.data ?? res);
-    return { ok: (res?.status ?? 200) < 300, status: res?.status ?? 200, data };
-}
-
-// ══════════════════════════════════════════
-//  GITHUB DEVICE FLOW
-// ══════════════════════════════════════════
-async function startGitHubDeviceFlow() {
-    const res = await copilotFetch(GITHUB_COPILOT_DEVICE_URL, {
-        method:'POST',
-        headers:{ 'Accept':'application/json','Content-Type':'application/json','User-Agent':'node-fetch/1.0' },
-        body:{ client_id: GITHUB_COPILOT_CLIENT_ID, scope: 'user:email' }
-    });
-    if (!res.ok) throw new Error('Device Flow 시작 실패: ' + JSON.stringify(res.data));
-    return {
-        deviceCode:      res.data.device_code,
-        userCode:        res.data.user_code,
-        verificationUri: res.data.verification_uri,
-        expiresIn:       res.data.expires_in,
-        interval:        res.data.interval || 5,
-    };
-}
-
-async function pollGitHubDeviceFlow(deviceCode, interval=5) {
-    const res = await copilotFetch(GITHUB_COPILOT_TOKEN_URL_O, {
-        method:'POST',
-        headers:{ 'Accept':'application/json','Content-Type':'application/json','User-Agent':'node-fetch/1.0' },
-        body:{ client_id: GITHUB_COPILOT_CLIENT_ID, device_code: deviceCode, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }
-    });
-    const d = res.data;
-    if (d.error === 'authorization_pending') return { pending: true };
-    if (d.error === 'slow_down') return { pending: true, slowDown: true };
-    if (d.error) throw new Error(d.error_description || d.error);
-    if (d.access_token) return { token: d.access_token };
-    throw new Error('예상치 못한 응답');
-}
-
-async function callCopilotAI(prompt, model='gpt-4o') {
-    const githubToken = await Storage.get(STUDIO_COPILOT_TOKEN_KEY);
-    if (!githubToken) throw new Error('Copilot GitHub 토큰이 없습니다. 설정에서 Device 인증을 해주세요.');
-    const apiToken = await getCopilotApiToken(githubToken);
-    // Custom URL support
-    const s = await Storage.get(STUDIO_SETTINGS_KEY) || {};
-    const chatUrl = s.copilot_api_url || GITHUB_COPILOT_CHAT_URL;
-    const res = await copilotFetch(chatUrl, {
-        method:'POST',
-        headers:{
-            'Authorization': `Bearer ${apiToken}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'Editor-Version': 'vscode/1.80.0',
-            'Copilot-Integration-Id': 'vscode-chat',
-        },
-        body:{ model, messages:[{ role:'user', content: prompt }], max_tokens:2048 }
-    });
-    if (!res.ok) throw new Error('Copilot API 오류: ' + JSON.stringify(res.data));
-    return res.data?.choices?.[0]?.message?.content || '(응답 없음)';
-}
-
-// ══════════════════════════════════════════
-//  CALL AI (Google / Claude / Copilot / LBI)
-// ══════════════════════════════════════════
-async function callAI(prompt, systemOverride = null) {
-    const s = await Storage.get(STUDIO_SETTINGS_KEY) || {};
-    // systemOverride가 있으면 프롬프트 앞에 시스템 지시사항으로 삽입
-    const effectivePrompt = systemOverride ? systemOverride + '\n\n---\n\n' + prompt : prompt;
-    const _origPrompt = prompt;
-    prompt = effectivePrompt;
-    const provider = s.provider || 'google';
-
-    try {
-        if (provider === 'copilot') {
-            const model = s.model_copilot || 'gpt-4o';
-            return await callCopilotAI(prompt, model);
-        }
-        if (provider === 'lbi') {
-            return await callLbiAI(prompt, s);
-        }
-        if (provider === 'claude') {
-            const key = s.key_claude || (await risuai.getArgument?.('claude_api_key')) || '';
-            if (!key) return '⚠️ Claude API 키가 없습니다.';
-            const model = s.model_claude || 'claude-sonnet-4-20250514';
-            const res = await risuai.nativeFetch('https://api.anthropic.com/v1/messages', {
-                method:'POST',
-                headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01'},
-                body: JSON.stringify({ model, max_tokens:2048, messages:[{role:'user',content:prompt}] })
-            });
-            const j = await res.json();
-            return j?.content?.[0]?.text || '(응답 없음)';
-        }
-        // default: Google AI
-        const key = s.key_google || (await risuai.getArgument?.('gemini_api_key')) || '';
-        if (!key) return '⚠️ Google AI API 키가 없습니다.';
-        const model = s.model_google || 'gemini-2.0-flash';
-        const safetyOff = s.safety_off;
-        const body = { contents:[{parts:[{text:prompt}]}] };
-        if (safetyOff) body.safetySettings = [
-            {category:'HARM_CATEGORY_SEXUALLY_EXPLICIT',threshold:'BLOCK_NONE'},
-            {category:'HARM_CATEGORY_HATE_SPEECH',threshold:'BLOCK_NONE'},
-            {category:'HARM_CATEGORY_HARASSMENT',threshold:'BLOCK_NONE'},
-            {category:'HARM_CATEGORY_DANGEROUS_CONTENT',threshold:'BLOCK_NONE'},
-        ];
-        const res = await risuai.nativeFetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-            { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }
-        );
-        const j = await res.json();
-        if (j.error) throw new Error(j.error.message);
-        return j?.candidates?.[0]?.content?.parts?.[0]?.text || '(응답 없음)';
-    } catch(e) {
-        return '❌ AI 호출 실패: ' + e.message;
-    }
-}
-
-async function callLbiAI(prompt, s) {
-    const lbiModelId = (await getLbiArgFromDB('other_model').catch(()=>null)) ||
-                       (await getLbiArgFromDB('othermodel').catch(()=>null));
-    if (!lbiModelId) throw new Error("LBI 설정에서 '루아/트리거 모델'을 선택해주세요.");
-    const modelDef = [
-        {uniqueId:'gemini-2.5-pro',    provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.5-pro'},
-        {uniqueId:'gemini-2.5-flash',  provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.5-flash'},
-        {uniqueId:'gemini-2.0-flash',  provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.0-flash'},
-        {uniqueId:'claude-sonnet-4-20250514',  provider:LBI_LLM_PROVIDERS.ANTHROPIC, id:'claude-sonnet-4-20250514'},
-        {uniqueId:'claude-opus-4-20250514',    provider:LBI_LLM_PROVIDERS.ANTHROPIC, id:'claude-opus-4-20250514'},
-        {uniqueId:'gpt-4o',            provider:LBI_LLM_PROVIDERS.OPENAI, id:'gpt-4o'},
-        {uniqueId:'gpt-4.1-2025-04-14',provider:LBI_LLM_PROVIDERS.OPENAI, id:'gpt-4.1-2025-04-14'},
-    ].find(d => d.uniqueId === lbiModelId);
-    const provider = modelDef?.provider || (lbiModelId.startsWith('gemini') ? LBI_LLM_PROVIDERS.GOOGLEAI : lbiModelId.startsWith('claude') ? LBI_LLM_PROVIDERS.ANTHROPIC : LBI_LLM_PROVIDERS.OPENAI);
-    const modelId  = modelDef?.id || lbiModelId;
-
-    if (provider === LBI_LLM_PROVIDERS.GOOGLEAI) {
-        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.googleAI.apiKey);
-        if (!keys.length) throw new Error('LBI: Google AI API 키 없음');
-        const key = keys[Math.floor(Math.random()*keys.length)];
-        const res = await risuai.nativeFetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`,
-            { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({contents:[{parts:[{text:prompt}]}]}) });
-        const j = await res.json();
-        return j?.candidates?.[0]?.content?.parts?.[0]?.text || '(응답 없음)';
-    }
-    if (provider === LBI_LLM_PROVIDERS.ANTHROPIC) {
-        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.anthropic.apiKey);
-        if (!keys.length) throw new Error('LBI: Anthropic API 키 없음');
-        const key = keys[Math.floor(Math.random()*keys.length)];
-        const res = await risuai.nativeFetch('https://api.anthropic.com/v1/messages', {
-            method:'POST',
-            headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01'},
-            body: JSON.stringify({ model: modelId, max_tokens:2048, messages:[{role:'user',content:prompt}] })
-        });
-        const j = await res.json();
-        return j?.content?.[0]?.text || '(응답 없음)';
-    }
-    if (provider === LBI_LLM_PROVIDERS.OPENAI) {
-        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.openai.apiKey);
-        if (!keys.length) throw new Error('LBI: OpenAI API 키 없음');
-        const key = keys[Math.floor(Math.random()*keys.length)];
-        const res = await risuai.nativeFetch('https://api.openai.com/v1/chat/completions', {
-            method:'POST',
-            headers:{'Content-Type':'application/json','Authorization':`Bearer ${key}`},
-            body: JSON.stringify({ model: modelId, max_tokens:2048, messages:[{role:'user',content:prompt}] })
-        });
-        const j = await res.json();
-        return j?.choices?.[0]?.message?.content || '(응답 없음)';
-    }
-    throw new Error(`지원하지 않는 LBI 프로바이더: ${provider}`);
-}
 
 
 
@@ -4166,6 +3985,171 @@ async function getCopilotApiToken(githubToken) {
     return response.data.token;
 }
 
+// ══════════════════════════════════════════
+//  GITHUB DEVICE FLOW
+// ══════════════════════════════════════════
+async function startGitHubDeviceFlow() {
+    const res = await copilotFetchJson(GITHUB_COPILOT_DEVICE_URL, {
+        method:'POST',
+        headers:{ 'Accept':'application/json','Content-Type':'application/json','User-Agent':'GitHubCopilotChat/0.24.1' },
+        body: JSON.stringify({ client_id: GITHUB_COPILOT_CLIENT_ID, scope: 'user:email' })
+    });
+    if (!res.ok) throw new Error('Device Flow 시작 실패: ' + JSON.stringify(res.data));
+    return {
+        deviceCode:      res.data.device_code,
+        userCode:        res.data.user_code,
+        verificationUri: res.data.verification_uri,
+        expiresIn:       res.data.expires_in,
+        interval:        res.data.interval || 5,
+    };
+}
+
+async function pollGitHubDeviceFlow(deviceCode, interval=5) {
+    const res = await copilotFetchJson(GITHUB_COPILOT_TOKEN_URL_O, {
+        method:'POST',
+        headers:{ 'Accept':'application/json','Content-Type':'application/json','User-Agent':'GitHubCopilotChat/0.24.1' },
+        body: JSON.stringify({ client_id: GITHUB_COPILOT_CLIENT_ID, device_code: deviceCode, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' })
+    });
+    const d = res.data;
+    if (d.error === 'authorization_pending') return { pending: true };
+    if (d.error === 'slow_down') return { pending: true, slowDown: true };
+    if (d.error) throw new Error(d.error_description || d.error);
+    if (d.access_token) return { token: d.access_token };
+    throw new Error('예상치 못한 응답');
+}
+
+async function callCopilotAI(prompt, model='gpt-4o') {
+    const githubToken = await Storage.get(STUDIO_COPILOT_TOKEN_KEY);
+    if (!githubToken) throw new Error('Copilot GitHub 토큰이 없습니다. 설정에서 Device 인증을 해주세요.');
+    const apiToken = await getCopilotApiToken(githubToken);
+    // Custom URL support
+    const s = await Storage.get(STUDIO_SETTINGS_KEY) || {};
+    const chatUrl = s.copilot_api_url || GITHUB_COPILOT_CHAT_URL;
+    const res = await copilotFetchJson(chatUrl, {
+        method:'POST',
+        headers:{
+            'Authorization': `Bearer ${apiToken}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Editor-Version': 'vscode/1.96.4',
+            'Editor-Plugin-Version': 'copilot-chat/0.24.1',
+            'User-Agent': 'GitHubCopilotChat/0.24.1',
+            'X-GitHub-Api-Version': '2024-12-15',
+        },
+        body: JSON.stringify({ model, messages:[{ role:'user', content: prompt }], max_tokens:2048 })
+    });
+    if (!res.ok) throw new Error('Copilot API 오류: ' + JSON.stringify(res.data));
+    return res.data?.choices?.[0]?.message?.content || '(응답 없음)';
+}
+
+// ══════════════════════════════════════════
+//  CALL AI (Google / Claude / Copilot / LBI)
+// ══════════════════════════════════════════
+async function callAI(prompt, systemOverride = null) {
+    const s = await Storage.get(STUDIO_SETTINGS_KEY) || {};
+    // systemOverride가 있으면 프롬프트 앞에 시스템 지시사항으로 삽입
+    const effectivePrompt = systemOverride ? systemOverride + '\n\n---\n\n' + prompt : prompt;
+    const _origPrompt = prompt;
+    prompt = effectivePrompt;
+    const provider = s.provider || 'google';
+
+    try {
+        if (provider === 'copilot') {
+            const model = s.model_copilot || 'gpt-4o';
+            return await callCopilotAI(prompt, model);
+        }
+        if (provider === 'lbi') {
+            return await callLbiAI(prompt, s);
+        }
+        if (provider === 'claude') {
+            const key = s.key_claude || (await risuai.getArgument?.('claude_api_key')) || '';
+            if (!key) return '⚠️ Claude API 키가 없습니다.';
+            const model = s.model_claude || 'claude-sonnet-4-20250514';
+            const res = await risuai.nativeFetch('https://api.anthropic.com/v1/messages', {
+                method:'POST',
+                headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01'},
+                body: JSON.stringify({ model, max_tokens:2048, messages:[{role:'user',content:prompt}] })
+            });
+            const j = await res.json();
+            return j?.content?.[0]?.text || '(응답 없음)';
+        }
+        // default: Google AI
+        const key = s.key_google || (await risuai.getArgument?.('gemini_api_key')) || '';
+        if (!key) return '⚠️ Google AI API 키가 없습니다.';
+        const model = s.model_google || 'gemini-2.0-flash';
+        const safetyOff = s.safety_off;
+        const body = { contents:[{parts:[{text:prompt}]}] };
+        if (safetyOff) body.safetySettings = [
+            {category:'HARM_CATEGORY_SEXUALLY_EXPLICIT',threshold:'BLOCK_NONE'},
+            {category:'HARM_CATEGORY_HATE_SPEECH',threshold:'BLOCK_NONE'},
+            {category:'HARM_CATEGORY_HARASSMENT',threshold:'BLOCK_NONE'},
+            {category:'HARM_CATEGORY_DANGEROUS_CONTENT',threshold:'BLOCK_NONE'},
+        ];
+        const res = await risuai.nativeFetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+            { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }
+        );
+        const j = await res.json();
+        if (j.error) throw new Error(j.error.message);
+        return j?.candidates?.[0]?.content?.parts?.[0]?.text || '(응답 없음)';
+    } catch(e) {
+        return '❌ AI 호출 실패: ' + e.message;
+    }
+}
+
+async function callLbiAI(prompt, s) {
+    const lbiModelId = (await getLbiArgFromDB('other_model').catch(()=>null)) ||
+                       (await getLbiArgFromDB('othermodel').catch(()=>null));
+    if (!lbiModelId) throw new Error("LBI 설정에서 '루아/트리거 모델'을 선택해주세요.");
+    const modelDef = [
+        {uniqueId:'gemini-2.5-pro',    provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.5-pro'},
+        {uniqueId:'gemini-2.5-flash',  provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.5-flash'},
+        {uniqueId:'gemini-2.0-flash',  provider:LBI_LLM_PROVIDERS.GOOGLEAI, id:'gemini-2.0-flash'},
+        {uniqueId:'claude-sonnet-4-20250514',  provider:LBI_LLM_PROVIDERS.ANTHROPIC, id:'claude-sonnet-4-20250514'},
+        {uniqueId:'claude-opus-4-20250514',    provider:LBI_LLM_PROVIDERS.ANTHROPIC, id:'claude-opus-4-20250514'},
+        {uniqueId:'gpt-4o',            provider:LBI_LLM_PROVIDERS.OPENAI, id:'gpt-4o'},
+        {uniqueId:'gpt-4.1-2025-04-14',provider:LBI_LLM_PROVIDERS.OPENAI, id:'gpt-4.1-2025-04-14'},
+    ].find(d => d.uniqueId === lbiModelId);
+    const provider = modelDef?.provider || (lbiModelId.startsWith('gemini') ? LBI_LLM_PROVIDERS.GOOGLEAI : lbiModelId.startsWith('claude') ? LBI_LLM_PROVIDERS.ANTHROPIC : LBI_LLM_PROVIDERS.OPENAI);
+    const modelId  = modelDef?.id || lbiModelId;
+
+    if (provider === LBI_LLM_PROVIDERS.GOOGLEAI) {
+        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.googleAI.apiKey);
+        if (!keys.length) throw new Error('LBI: Google AI API 키 없음');
+        const key = keys[Math.floor(Math.random()*keys.length)];
+        const res = await risuai.nativeFetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`,
+            { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({contents:[{parts:[{text:prompt}]}]}) });
+        const j = await res.json();
+        return j?.candidates?.[0]?.content?.parts?.[0]?.text || '(응답 없음)';
+    }
+    if (provider === LBI_LLM_PROVIDERS.ANTHROPIC) {
+        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.anthropic.apiKey);
+        if (!keys.length) throw new Error('LBI: Anthropic API 키 없음');
+        const key = keys[Math.floor(Math.random()*keys.length)];
+        const res = await risuai.nativeFetch('https://api.anthropic.com/v1/messages', {
+            method:'POST',
+            headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01'},
+            body: JSON.stringify({ model: modelId, max_tokens:2048, messages:[{role:'user',content:prompt}] })
+        });
+        const j = await res.json();
+        return j?.content?.[0]?.text || '(응답 없음)';
+    }
+    if (provider === LBI_LLM_PROVIDERS.OPENAI) {
+        const keys = await getApiKeysFromLbi(LBI_COMMON_PROVIDER_KEYS.openai.apiKey);
+        if (!keys.length) throw new Error('LBI: OpenAI API 키 없음');
+        const key = keys[Math.floor(Math.random()*keys.length)];
+        const res = await risuai.nativeFetch('https://api.openai.com/v1/chat/completions', {
+            method:'POST',
+            headers:{'Content-Type':'application/json','Authorization':`Bearer ${key}`},
+            body: JSON.stringify({ model: modelId, max_tokens:2048, messages:[{role:'user',content:prompt}] })
+        });
+        const j = await res.json();
+        return j?.choices?.[0]?.message?.content || '(응답 없음)';
+    }
+    throw new Error(`지원하지 않는 LBI 프로바이더: ${provider}`);
+}
+
+
 async function callGitHubCopilot_API(prompt, sidecarConfig) {
     const githubToken = await getEffectiveCopilotToken();
     if (!githubToken) throw new Error('GitHub Copilot 토큰이 없습니다. 설정에서 수동 토큰을 저장해주세요.');
@@ -6098,7 +6082,7 @@ body.theme-forest{--bg:#060f07;--bg2:#0a1a0b;--bg3:#0f2611;--green:#39ff6a;--blu
         const lbiModelNameEl = document.getElementById('dt-lbi-model-name');
 
         closeBtn?.addEventListener('click', () => {
-            risuai.hideContainer();
+            studioHide();
         });
 
         const setAiSettingsCollapsed = (collapsed) => {
@@ -6498,7 +6482,7 @@ body.theme-forest{--bg:#060f07;--bg2:#0a1a0b;--bg3:#0f2611;--green:#39ff6a;--blu
         });
     } catch (e) {
         Logger.error('Settings panel error:', e);
-        try { await risuai.hideContainer(); } catch {}
+        studioHide();
     }
 }
 
@@ -6532,8 +6516,17 @@ function openErosPanel() {
 // ══════════════════════════════════════════
 //  UI
 // ══════════════════════════════════════════
+function studioHide() {
+    // 플러그인 UI 포인터 이벤트 차단 — RisuAI 네이티브 UI 클릭 보장
+    document.body.style.pointerEvents = 'none';
+    try { risuai.hideContainer(); } catch {}
+}
+function studioShow() {
+    document.body.style.pointerEvents = '';
+}
 async function openMainWindow() {
     await risuai.showContainer("fullscreen");
+    studioShow();
     buildUI();
 }
 
@@ -6588,7 +6581,7 @@ body{font-family:var(--body);background:var(--bg);color:var(--text);height:100dv
 .pp-gen-btn-chat{background:linear-gradient(135deg,#6b21a8,#9333ea);}
 .pp-gen-btn:disabled{opacity:0.5;cursor:not-allowed;}
 
-@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}@keyframes blink{0%,80%,100%{opacity:0.15;}40%{opacity:1;}}
 .hdr-right{display:flex;align-items:center;gap:6px;margin-left:auto;flex-shrink:0;}
 .icon-btn{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:var(--radius-xs);background:transparent;border:1px solid transparent;color:var(--text2);cursor:pointer;transition:all 0.15s;}
 .icon-btn:hover{background:rgba(255,255,255,0.06);border-color:var(--border2);color:var(--text);}
@@ -6786,7 +6779,7 @@ input[type=range]{width:100%;accent-color:var(--green);cursor:pointer;}
     <button class="icon-btn" onclick="showWs('settings')">⚙️</button>
     <button class="icon-btn" onclick="loadRisuChar()" title="현재 캐릭터 불러오기">🔄</button>
     <button class="icon-btn" id="status-toggle-btn" onclick="toggleStatusBarSide()" title="상태바 위치 변경">▷</button>
-    <button class="icon-btn" onclick="risuai.hideContainer()">✕</button>
+    <button class="icon-btn" onclick="studioHide()">✕</button>
   </div>
 </header>
 
@@ -7236,7 +7229,7 @@ input[type=range]{width:100%;accent-color:var(--green);cursor:pointer;}
   <button class="mob-btn" id="mob-persona" onclick="switchMobTab('persona')"><span class="mob-icon">🎭</span>페르소나</button>
   <button class="mob-btn" id="mob-sandbox" onclick="switchMobTab('sandbox')"><span class="mob-icon">⚡</span>실험실</button>
   <button class="mob-btn" id="mob-settings" onclick="switchMobTab('settings')"><span class="mob-icon">⚙️</span>설정</button>
-  <button class="mob-btn" onclick="risuai.hideContainer()" style="color:var(--text3)"><span class="mob-icon">✕</span>나가기</button>
+  <button class="mob-btn" onclick="studioHide()" style="color:var(--text3)"><span class="mob-icon">✕</span>나가기</button>
 </nav>
 
 <!-- MODALS -->
@@ -7386,22 +7379,27 @@ function initLogic() {
 //  WS / MODAL
 // ══════════════════════════════════════════
 function showWs(id) {
+    closeModal(); // 탭 전환 시 열린 모달 항상 닫기
     document.querySelectorAll('.ws').forEach(w => w.classList.remove('active'));
     const el = document.getElementById('ws-' + id);
     if (el) el.classList.add('active');
-    // Update nav button active states
     ['home','editor','sandbox','persona'].forEach(ws => {
         const btn = document.getElementById('nav-' + ws);
         if (btn) btn.classList.toggle('active', ws === id);
     });
 }
 function openModal(id) {
-    document.getElementById('modal-overlay').classList.add('open');
+    const overlay = document.getElementById('modal-overlay');
+    if (!overlay) return;
+    overlay.classList.add('open');
     document.querySelectorAll('.modal').forEach(m => m.style.display = 'none');
     const el = document.getElementById(id);
     if (el) el.style.display = 'flex';
 }
-function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+function closeModal() {
+    const overlay = document.getElementById('modal-overlay');
+    if (overlay) overlay.classList.remove('open');
+}
 function overlayClick(e) { if (e.target.id === 'modal-overlay') closeModal(); }
 
 // ══════════════════════════════════════════
@@ -7735,6 +7733,8 @@ function initKeyboardShortcuts() {
         }
         if (e.key === 'Escape') { closeModal(); }
     });
+    // 플러그인 창이 숨겨질 때 모달 자동 닫기 (RisuAI 설정 열 때 블로킹 방지)
+    document.addEventListener('visibilitychange', () => { if (document.hidden) { closeModal(); } else { studioShow(); } });
     // Ctrl+Enter 전송
     document.getElementById('chat-input')?.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); sendMsg(); }
@@ -7830,13 +7830,13 @@ async function sendMsg() {
     const input = document.getElementById('chat-input');
     const text = input.value.trim();
     if (!text && chatAttachFiles.length === 0) return;
-    
+
     let displayText = text;
     let promptText = text;
-    
+
     // 첨부 파일을 채팅에 포함
     if (chatAttachFiles.length > 0) {
-        const fileContext = chatAttachFiles.map(f => 
+        const fileContext = chatAttachFiles.map(f =>
             `[첨부파일: ${f.name}]\n\`\`\`\n${f.content.slice(0, 3000)}${f.content.length > 3000 ? '\n...(이하 생략)' : ''}\n\`\`\``
         ).join('\n\n');
         promptText = (text ? text + '\n\n' : '') + fileContext;
@@ -7844,16 +7844,40 @@ async function sendMsg() {
         chatAttachFiles = [];
         updateAttachedFilesBar();
     }
-    
+
     input.value = '';
     input.style.height = '';
     updateTokenCounter();
     addUserMsg(displayText);
-    const prompt = buildPrompt(promptText);
-    const result = await callAI(prompt);
+
+    // 로딩 표시 + 버튼 비활성화
+    const sendBtn = document.querySelector('.bar-send');
+    if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '⏳'; }
+    input.disabled = true;
+
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'msg';
+    loadingDiv.id = 'chat-loading-indicator';
+    loadingDiv.innerHTML = `<div class="avatar">🐱</div><div class="bubble cat" style="display:flex;align-items:center;gap:8px;color:var(--text3);font-style:italic"><span style="display:inline-flex;gap:4px"><span style="animation:blink 1.2s 0s infinite both">●</span><span style="animation:blink 1.2s 0.4s infinite both">●</span><span style="animation:blink 1.2s 0.8s infinite both">●</span></span> 생각 중다냥...</div>`;
+    const log = document.getElementById('chat-log');
+    if (log) { log.appendChild(loadingDiv); log.scrollTop = log.scrollHeight; }
+
+    let result;
+    try {
+        const prompt = buildPrompt(promptText);
+        result = await callAI(prompt);
+    } catch(e) {
+        result = '❌ AI 호출 실패: ' + e.message;
+    } finally {
+        const indicator = document.getElementById('chat-loading-indicator');
+        if (indicator) indicator.remove();
+        if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '➤'; }
+        input.disabled = false;
+        input.focus();
+    }
+
     addCatMsg(result || '분석 완료다냥! 🐾');
 }
-function handleKey(e) { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } }
 function autoResize(el) { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,120)+'px'; }
 
 function buildPrompt(userText) {
@@ -8523,7 +8547,7 @@ async function handleFiles(e) {
 //  WINDOW 등록
 // ══════════════════════════════════════════
 Object.assign(window, {
-    showWs, openModal, closeModal, overlayClick, sendMsg, handleKey, autoResize, openErosPanel,
+    showWs, openModal, closeModal, overlayClick, studioHide, studioShow, sendMsg, handleKey, autoResize, openErosPanel,
     initEditorWs, switchEditorTab, runEditorAI, saveEditorField, loadEditorChar,
     initPersonaWs, ppGenerate, ppReroll, ppViewRaw, ppEditTranslate, ppSavePersona, ppSaveAndBind,
     ppUpdatePresetUI, ppUpdateSheetUI, ppLoadCharInfo, ppGenerateWithChat, ppSendChat, ppCloseChat,
